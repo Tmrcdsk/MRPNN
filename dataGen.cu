@@ -5,6 +5,7 @@
 #include <chrono>
 #include <random>
 #include <iomanip>
+#include <filesystem>
 
 
 float hash1()
@@ -42,7 +43,7 @@ public:
 };
 
 
-DisneyDescriptor GetDisneyDesc(VolumeRender& volume, float3 uv, float3 v, float3 s, float alpha, float descSizeAtLevel0) {
+DisneyDescriptor GetDisneyDesc(VolumeRender& volume, float3 uv, float3 v, float3 s, float epsilon, float descSizeAtLevel0) {
 
     DisneyDescriptor descriptor;
     v = normalize(v);
@@ -61,6 +62,8 @@ DisneyDescriptor GetDisneyDesc(VolumeRender& volume, float3 uv, float3 v, float3
     for (size_t layerId = 0; layerId < DisneyDescriptor::LAYERS_CNT; layerId++)
     {
         float currentmipmapLevel = max(min(mipmapLevel - 1.0f, 9.0f), 0.0f); //-2都去到2x2了采样没意义，-1就到1x1了
+        // float currentmipmapLevel = max(min(mipmapLevel - 2.0f, 9.0f), 0.0f); // For RPNN
+        
         uint32_t sampleId = 0;
         for (int z = -2; z <= 6; z++)
         {
@@ -73,7 +76,7 @@ DisneyDescriptor GetDisneyDesc(VolumeRender& volume, float3 uv, float3 v, float3
 
                     float density = volume.DensityAtUV(int(currentmipmapLevel + 0.001f), pos);
 
-                    descriptor.layers[layerId].density[sampleId] = density * alpha / 64.0f;
+                    descriptor.layers[layerId].density[sampleId] = density * epsilon / 64.0f;
                     sampleId++;
                 }
             }
@@ -91,7 +94,7 @@ public:
     float3 Position;
     float3 ViewDir;
     float3 LightDir;
-    float Alpha;
+    float Epsilon;
     float g;
 
     SamplePoint(float3 p, float3 v, float3 l, float a, float g_)
@@ -99,7 +102,7 @@ public:
         Position = p;
         ViewDir = v;
         LightDir = l;
-        Alpha = a;
+        Epsilon = a;
         g = g_;
     }
 };
@@ -151,9 +154,9 @@ float RayBoxDistance_(float3 p, float3 dir)
 
     return tma;
 }
-bool DeterminateNextVertex(VolumeRender& CurrentVolume, float alpha, float g, float3 pos, float3 dir, float dis, float3* nextPos, float3* nextDir)
+bool DeterminateNextVertex(VolumeRender& CurrentVolume, float epsilon, float g, float3 pos, float3 dir, float dis, float3* nextPos, float3* nextDir)
 {
-    float SMax = CurrentVolume.max_density * alpha;
+    float SMax = CurrentVolume.max_density * epsilon;
     float t = 0;
     int loop_num = 0;
     while (loop_num++ < 10000)
@@ -171,7 +174,7 @@ bool DeterminateNextVertex(VolumeRender& CurrentVolume, float alpha, float g, fl
         {
             rk = hash1();
             float density = CurrentVolume.DensityAtPosition(0, pos + (dir * t));
-            float S = density * alpha;
+            float S = density * epsilon;
             if (S / SMax > rk)
             {
                 break;
@@ -186,7 +189,7 @@ bool DeterminateNextVertex(VolumeRender& CurrentVolume, float alpha, float g, fl
     *nextPos = (dir * t) + pos;
     return true;
 }
-void MeanFreePathSample(VolumeRender& CurrentVolume, vector<SamplePoint>& Samples, float3 ori, float3 dir, float3 lightDir, int maxcount, float alpha, float g)
+void MeanFreePathSample(VolumeRender& CurrentVolume, vector<SamplePoint>& Samples, float3 ori, float3 dir, float3 lightDir, int maxcount, float epsilon, float g)
 {
     dir = normalize(dir);
     lightDir = normalize(lightDir);
@@ -203,7 +206,7 @@ void MeanFreePathSample(VolumeRender& CurrentVolume, vector<SamplePoint>& Sample
         {
             float3 nextPos, nextDir;
             float dis = RayBoxDistance_(samplePosition, rayDirection);
-            bool in_volume = DeterminateNextVertex(CurrentVolume, alpha, g, samplePosition, rayDirection, dis, &nextPos, &nextDir);
+            bool in_volume = DeterminateNextVertex(CurrentVolume, epsilon, g, samplePosition, rayDirection, dis, &nextPos, &nextDir);
 
             if (!in_volume || Samples.size() >= maxcount)
             {
@@ -211,7 +214,7 @@ void MeanFreePathSample(VolumeRender& CurrentVolume, vector<SamplePoint>& Sample
             }
             if (i == 0 || dot(samplePosition - nextPos, samplePosition - nextPos) > 1.0 / 64.0 || hash1() > 0.9)
             {
-                Samples.push_back(SamplePoint(hash1() > 0.5 ? nextPos + hash3box(1.0 / 128.0) : nextPos, hash1() > 0.25 ? dir : rayDirection, lightDir, alpha, g));
+                Samples.push_back(SamplePoint(hash1() > 0.5 ? nextPos + hash3box(1.0 / 128.0) : nextPos, hash1() > 0.25 ? dir : rayDirection, lightDir, epsilon, g));
             }
             samplePosition = nextPos;
             rayDirection = nextDir;
@@ -235,17 +238,17 @@ void GetDesiredCountSample(VolumeRender& CurrentVolume, vector<SamplePoint>& Sam
         float3 ori = hash31sphere() * 3.0f;
         float3 dir = normalize(hash31sphere() + normalize(-ori));
         float3 ldir = hash31sphere();
-        float Alpha = lerp(density_min, density_max, hash1());//lerp(density_min, density_max, 0.5f);//;/*没有随机*/
+        float epsilon = lerp(density_min, density_max, hash1());//lerp(density_min, density_max, 0.5f);//;/*没有随机*/
         float g = 0.857f;//没有随机
-        MeanFreePathSample(CurrentVolume, Samples, ori, dir, ldir, Count, Alpha, g);
+        MeanFreePathSample(CurrentVolume, Samples, ori, dir, ldir, Count, epsilon, g);
     }
 }
 
-void DebugSamples(string vpath, string outpath, int count = 512, float alpha = 1.0, float alpha_max = 5.0)
+void DebugSamples(string vpath, string outpath, int count = 512, float epsilon = 1.0, float epsilon_max = 5.0)
 {
     VolumeRender v(vpath);
     vector<SamplePoint> Samples;
-    GetDesiredCountSample(v, Samples, count, alpha, alpha_max);
+    GetDesiredCountSample(v, Samples, count, epsilon, epsilon_max);
     std::ofstream outfile(outpath);
     for (SamplePoint& s : Samples)
     {
@@ -262,16 +265,63 @@ void DebugSamples(string vpath, string outpath, int count = 512, float alpha = 1
     }
 }
 
+/*
+namespace fs = std::filesystem;
+
+static void CollectVolFiles(const fs::path& dir, std::vector<std::string>& list)
+{
+    list.clear();
+
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+
+        const auto& p = e.path();
+        if (p.extension() == ".vol") {
+            // 如果你后续代码期望相对文件名：用 filename()
+            list.push_back(p.filename().string());
+
+            // 如果你后续加载需要完整路径：改成这一行
+            // list.push_back(p.string());
+        }
+    }
+
+    std::sort(list.begin(), list.end());
+}
+*/
+
 int main()
 {
-    std::string DataPath = "D:/Pytorch/VolumetricNN-main/Release/Data/";
+    std::string DataPath = "D:/Course/Projects/HairRender/MRPNN/Data/";
     std::string DataName = "DS_10000.csv";
-    std::string RelativePath = "D:/Pytorch/volume-cudagui0408/Build/Release/Data/";
+    std::string RelativePath = "D:/Course/Projects/HairRender/MRPNN/MyData/";
     vector<std::string> DataList;
     DataList.push_back("dense.512.txt");
     DataList.push_back("mediocris_high.512.txt");
     DataList.push_back("cumulus_humilis.512.txt");
     DataList.push_back("cumulus_congestus1.512.txt");
+    /*
+    中积云
+    淡积云
+    浓积云
+    */
+
+    // CollectVolFiles(RelativePath, DataList);
+    //for (auto& s : DataList) {
+    //    std::cout << s << std::endl;
+    //}
+    //return 0;
+    //DataList.push_back("cloud-049.vol");
+    //DataList.push_back("cloud-190.vol");
+    //DataList.push_back("cloud-1090.vol");
+    //DataList.push_back("cloud-1104.vol");
+    //DataList.push_back("cloud-1153.vol");
+    //DataList.push_back("cloud-1191.vol");
+    //DataList.push_back("cloud-1196.vol");
+    //DataList.push_back("cloud-1198.vol");
+    //DataList.push_back("cloud-1595.vol");
+    //DataList.push_back("cloud-1840.vol");
+    //DataList.push_back("cloud-1873.vol");
+
     vector<float> DensityMin;
     DensityMin.push_back(0.5f);
     DensityMin.push_back(0.5f);
@@ -289,6 +339,9 @@ int main()
     int CountPer = CountAll / DataList.size() / MiniLoopCount;
 
     vector<DisneyDescriptor> Data;
+
+    auto start = std::chrono::steady_clock::now();
+
     std::ofstream outfile(DataPath + DataName);
     outfile << "# " << CountAll << "x" << "(5,5,9)" << "x" << "10 Layers" << std::endl;
     for (int l = 0; l < MiniLoopCount; l++)
@@ -303,9 +356,15 @@ int main()
             float CurrentDensityMin = DensityMin[i];
             float CurrentDensityMax = DensityMax[i];
             VolumeRender v(RelativePath + CurrentData);
+
+            // float RealMax = v.max_density;
+            // float RealMin = 0.0f;
+            // printf("Auto-detected Max Density: %f\n", RealMax);
+
             printf("Getting Mean Free Path Samples\n");
             vector<SamplePoint> Samples;
             GetDesiredCountSample(v, Samples, CountPer, CurrentDensityMin, CurrentDensityMax);
+            // GetDesiredCountSample(v, Samples, CountPer, RealMin, RealMax);
             vector<float3> SampleOris;
             vector<float3> SampleDirs;
             vector<float3> SampleLDirs;
@@ -320,7 +379,7 @@ int main()
                 SampleOris.push_back(CurrentSample.Position);
                 SampleDirs.push_back(CurrentSample.ViewDir);
                 SampleLDirs.push_back(CurrentSample.LightDir);
-                SampleAlphas.push_back(CurrentSample.Alpha);
+                SampleAlphas.push_back(CurrentSample.Epsilon);
                 SampleGs.push_back(CurrentSample.g);
                 SampleScatters.push_back(1.0f);
             }
@@ -328,9 +387,12 @@ int main()
             vector<float3> CurrentRadiances = v.GetSamples(SampleAlphas, SampleOris, SampleDirs, SampleLDirs, SampleGs, SampleScatters, LightColor, 512, 1024);
             printf("RealRadianceSet Size:%d\n", CurrentRadiances.size());
             float gap = 0.25f / 1024.0f;
+            // float gap = 0.5f / 1024.0f; // For RPNN
             for (int i = 0; i < CurrentRadiances.size(); i++)
             {
                 DisneyDescriptor desc = GetDisneyDesc(v, SampleOris[i] + float3{ 0.5f, 0.5f, 0.5f }, SampleDirs[i], SampleLDirs[i], SampleAlphas[i], gap);
+                // float Li = max(CurrentRadiances[i].x, 0.0f);
+                // desc.Radiance = log1pf(Li); // For RPNN
                 desc.Radiance = CurrentRadiances[i].x;
                 Data.push_back(desc);
             }
@@ -362,6 +424,19 @@ int main()
         }
     }
     outfile.close();
+
+    auto end = std::chrono::steady_clock::now();
+    auto dtime = end - start;
+    std::cout << "Render complete:\n";
+    std::cout << "Time taken: "
+        << std::chrono::duration_cast<std::chrono::hours>(dtime).count()
+        << " hours\n";
+    std::cout << "          : "
+        << std::chrono::duration_cast<std::chrono::minutes>(dtime).count()
+        << " minutes\n";
+    std::cout << "          : "
+        << std::chrono::duration_cast<std::chrono::seconds>(dtime).count()
+        << " seconds\n";
 
     return 0;
 }

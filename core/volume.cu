@@ -776,7 +776,186 @@ VolumeRender::VolumeRender(int resolution) : resolution(resolution) {
     MallocMemory();
 }
 
+static bool EndsWith(const std::string& s, const std::string& suf) {
+    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+static std::string ReplaceExt(std::string p, const std::string& ext) {
+    auto pos = p.find_last_of('.');
+    if (pos == std::string::npos) return p + ext;
+    return p.substr(0, pos) + ext;
+}
+
+bool VolumeRender::LoadFromMitsubaVol(const std::string& volPath) {
+    std::ifstream in(volPath, std::ios::binary);
+    if (!in) return false;
+
+    // === Header (little-endian) ===
+    char magic[3];
+    in.read(magic, 3);
+    if (magic[0] != 'V' || magic[1] != 'O' || magic[2] != 'L') return false;
+
+    uint8_t version = 0;
+    in.read(reinterpret_cast<char*>(&version), 1);
+
+    int32_t encoding = 0;
+    int32_t xres = 0, yres = 0, zres = 0;
+    int32_t channels = 0;
+    in.read(reinterpret_cast<char*>(&encoding), 4);
+    in.read(reinterpret_cast<char*>(&xres), 4);
+    in.read(reinterpret_cast<char*>(&yres), 4);
+    in.read(reinterpret_cast<char*>(&zres), 4);
+    in.read(reinterpret_cast<char*>(&channels), 4);
+
+    float bbox[6];
+    in.read(reinterpret_cast<char*>(bbox), sizeof(float) * 6);
+
+    // 格式/通道约束：Mitsuba 的 .vol 支持 channels=1/3/6，encoding=1(float32):contentReference[oaicite:2]{index=2}
+    if (encoding != 1) return false;
+    if (xres <= 0 || yres <= 0 || zres <= 0) return false;
+    if (channels != 1 && channels != 3 && channels != 6) return false;
+
+    const size_t srcVoxelCount = size_t(xres) * size_t(yres) * size_t(zres);
+    std::vector<float> src(srcVoxelCount * size_t(channels));
+    in.read(reinterpret_cast<char*>(src.data()), sizeof(float) * src.size());
+    if (!in) return false;
+
+    auto lerp = [](float a, float b, float t) { return a * (1.0f - t) + b * t; };
+
+    auto srcAt = [&](int xi, int yi, int zi, int c) -> float {
+        xi = std::clamp(xi, 0, int(xres) - 1);
+        yi = std::clamp(yi, 0, int(yres) - 1);
+        zi = std::clamp(zi, 0, int(zres) - 1);
+        size_t idx = (size_t(zi) * size_t(yres) + size_t(yi)) * size_t(xres) + size_t(xi);
+        return src[idx * size_t(channels) + size_t(c)];
+        };
+
+    auto sampleTrilinear = [&](float u, float v, float w, int c) -> float {
+        // u,v,w: [0,1] in SOURCE normalized grid coordinates
+        float fx = u * float(xres - 1);
+        float fy = v * float(yres - 1);
+        float fz = w * float(zres - 1);
+
+        int x0 = int(std::floor(fx)), x1 = x0 + 1;
+        int y0 = int(std::floor(fy)), y1 = y0 + 1;
+        int z0 = int(std::floor(fz)), z1 = z0 + 1;
+
+        float tx = fx - float(x0);
+        float ty = fy - float(y0);
+        float tz = fz - float(z0);
+
+        float c000 = srcAt(x0, y0, z0, c), c100 = srcAt(x1, y0, z0, c);
+        float c010 = srcAt(x0, y1, z0, c), c110 = srcAt(x1, y1, z0, c);
+        float c001 = srcAt(x0, y0, z1, c), c101 = srcAt(x1, y0, z1, c);
+        float c011 = srcAt(x0, y1, z1, c), c111 = srcAt(x1, y1, z1, c);
+
+        float c00 = lerp(c000, c100, tx);
+        float c10 = lerp(c010, c110, tx);
+        float c01 = lerp(c001, c101, tx);
+        float c11 = lerp(c011, c111, tx);
+
+        float c0 = lerp(c00, c10, ty);
+        float c1 = lerp(c01, c11, ty);
+
+        return lerp(c0, c1, tz);
+        };
+
+    auto collapseToDensity_src = [&](float su, float sv, float sw) -> float {
+        if (channels == 1) return sampleTrilinear(su, sv, sw, 0);
+        float a = sampleTrilinear(su, sv, sw, 0);
+        float b = sampleTrilinear(su, sv, sw, 1);
+        float c = sampleTrilinear(su, sv, sw, 2);
+        return (a + b + c) / 3.0f;
+        };
+
+    // ===== Route A: use bbox to embed into a bounding cube =====
+    float3 bmin = make_float3(bbox[0], bbox[1], bbox[2]);
+    float3 bmax = make_float3(bbox[3], bbox[4], bbox[5]);
+    float3 extent = make_float3(bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z);
+    float3 center = make_float3(0.5f * (bmin.x + bmax.x), 0.5f * (bmin.y + bmax.y), 0.5f * (bmin.z + bmax.z));
+
+    float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
+    if (maxExtent <= 0.0f) return false;
+
+    // 你也可以改成固定 512，和 MRPNN demo 一致；这里先保持“无损接入”用 maxDim
+    const int dstRes = std::max({ xres, yres, zres });
+    resolution = dstRes;
+    MallocMemory(); // datas size = res^3
+
+    // 可选：保持光学厚度（如果 MRPNN 的步长在 unit cube 上，这一项通常更接近 Mitsuba）
+    const bool kCompensateOpticalDepth = true;
+    const float sigmaScale = kCompensateOpticalDepth ? maxExtent : 1.0f;
+
+    //float Lx = bbox[3] - bbox[0];
+    //float Ly = bbox[4] - bbox[1];
+    //float Lz = bbox[5] - bbox[2];
+    //float bboxScale = std::max({ Lx, Ly, Lz });
+
+    for (int z = 0; z < resolution; ++z) {
+        for (int y = 0; y < resolution; ++y) {
+            for (int x = 0; x < resolution; ++x) {
+                // dst in [0,1]^3
+                float3 q = make_float3(
+                    (x + 0.5f) / float(resolution),
+                    (y + 0.5f) / float(resolution),
+                    (z + 0.5f) / float(resolution)
+                );
+
+                // map to world coord inside bounding cube of side maxExtent centered at bbox center
+                float3 p = make_float3(
+                    center.x + (q.x - 0.5f) * maxExtent,
+                    center.y + (q.y - 0.5f) * maxExtent,
+                    center.z + (q.z - 0.5f) * maxExtent
+                );
+
+                // convert to SOURCE normalized coordinate s in [0,1]^3 using bbox
+                float su = (p.x - bmin.x) / extent.x;
+                float sv = (p.y - bmin.y) / extent.y;
+                float sw = (p.z - bmin.z) / extent.z;
+
+                float d = 0.0f;
+                if (su >= 0.f && su <= 1.f && sv >= 0.f && sv <= 1.f && sw >= 0.f && sw <= 1.f) {
+                    d = collapseToDensity_src(su, sv, sw) * sigmaScale;
+                }
+
+                datas[(z * resolution + y) * resolution + x] = d;
+            }
+        }
+    }
+
+    // !!! Route A：先不要做 max 归一化（mx），否则云的对比度很容易被压扁
+    // 你应该用 MRPNN GUI 里的 alpha / density scale 去调可视化强度
+
+    // 1) 统计一下你的 raw 密度量级（强烈建议打印）
+    float maxv = 0.f, sum = 0.f;
+    int N = resolution * resolution * resolution;
+    for (int i = 0; i < N; ++i) {
+        float d = datas[i];
+        maxv = std::max(maxv, d);
+        sum += d;
+    }
+    float meanv = sum / float(N);
+    printf("[VOL] raw max=%g, mean=%g\n", maxv, meanv);
+
+    float densityScale = 4.0f / meanv;
+
+    //if (maxv > 0.f) densityScale = 1.0f / maxv;
+
+    // 3) 烘焙到 datas
+    for (int i = 0; i < N; ++i)
+        datas[i] *= densityScale;
+
+    printf("xres=%d, yres=%d, zres=%d, channels=%d, bbox=[%.3f %.3f %.3f %.3f %.3f %.3f]\n",
+        xres, yres, zres, channels,
+        bbox[0], bbox[1], bbox[2], bbox[3], bbox[4], bbox[5]);
+
+    return true;
+}
+
+
 VolumeRender::VolumeRender(string path) {
+
+    // 统一：xxx.vol -> xxx.bin；否则 xxx -> xxx.bin
+    std::string binPath = EndsWith(path, ".vol") ? ReplaceExt(path, ".bin") : (path + ".bin");
 
     if (FILE* file = fopen((path + ".bin").c_str(), "rb")) {
         fread(&resolution, sizeof(int), 1, file);
@@ -837,6 +1016,21 @@ VolumeRender::VolumeRender(string path) {
             }
         }
         infile.close();
+    }
+    else if (format == "vol") {
+        if (!LoadFromMitsubaVol(path)) {
+            printf("Failed to load .vol: %s\n", path.c_str());
+            return;
+        }
+        Update();
+
+        // 可选：缓存成 .bin，后续加载更快
+        //if (FILE* out = fopen(binPath.c_str(), "wb")) {
+        //    fwrite(&resolution, sizeof(int), 1, out);
+        //    fwrite(datas, sizeof(float), resolution * resolution * resolution, out);
+        //    fclose(out);
+        //}
+        return;
     }
     else
     {
@@ -1121,6 +1315,18 @@ void VolumeRender::UpdateHGLut(float g)
 
     CheckError;
 
+    cudaMemcpy2DFromArray(
+        hglut,
+        LUT_SIZE * sizeof(float),
+        hglut_dev,
+        0,
+        0,
+        LUT_SIZE * sizeof(float),
+        LUT_SIZE,
+        cudaMemcpyDeviceToHost);
+
+    CheckError;
+
     hginlut = g;
 }
 float VolumeRender::GetHGLut(float cos, float angle)
@@ -1137,9 +1343,9 @@ float VolumeRender::GetHGLut(float cos, float angle)
     float a10 = hglut[u1 + v0 * LUT_SIZE];
     float a01 = hglut[u0 + v1 * LUT_SIZE];
     float a11 = hglut[u1 + v1 * LUT_SIZE];
-    float ax0 = lerp(a00, a10, frac(v * LUT_SIZE));
-    float ax1 = lerp(a01, a11, frac(v * LUT_SIZE));
-    float axx = lerp(ax0, ax1, frac(u * LUT_SIZE));
+    float ax0 = lerp(a00, a10, frac(u * LUT_SIZE));
+    float ax1 = lerp(a01, a11, frac(u * LUT_SIZE));
+    float axx = lerp(ax0, ax1, frac(v * LUT_SIZE));
     return axx;
 }
 void VolumeRender::Update() {

@@ -1,0 +1,1 @@
+python .\export_mrpnn_weights.py --checkpoint .\train\runs\20260324_165339\best.pt --template ..\core\NNWeight.cuh --output ..\core\NNWeight_500000.cuh

@@ -349,3 +349,12 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+
+build2019/
+MyData/
+TestCase/
+Data/
+
+train/train/
+train/runs/
+train/cache/

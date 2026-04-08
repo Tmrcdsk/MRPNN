@@ -86,9 +86,13 @@ public:
 
 	float max_density = 0.00001;
 
+	float m_DensityScale = 1.0f;
+
 	VolumeRender(int resolution);
 	VolumeRender(string path);
 	~VolumeRender();
+
+	bool LoadFromMitsubaVol(const std::string& volPath);
 
 	void SetData(int x, int y, int z, float value);
 

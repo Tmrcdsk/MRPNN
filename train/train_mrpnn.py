@@ -1,0 +1,848 @@
+﻿import argparse
+import csv
+import hashlib
+import json
+import math
+import random
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader, Dataset, Subset
+from tqdm import tqdm
+
+
+FEATURE_COLUMNS = 579
+TOTAL_COLUMNS = 580
+POINT_COUNT = 192
+LOW_GROUPS = [(0, 8), (8, 16), (16, 32), (32, 48), (48, 64), (64, 96), (96, 128), (128, 160)]
+HIGH_GROUPS = [(160, 168), (168, 176), (176, 184), (184, 192)]
+
+LOW_SIZES = [end - start for start, end in LOW_GROUPS]
+HIGH_SIZES = [end - start for start, end in HIGH_GROUPS]
+
+DENSITY_SLICE = slice(0, POINT_COUNT)
+TRANSMITTANCE_SLICE = slice(POINT_COUNT, POINT_COUNT * 2)
+PHASE_SLICE = slice(POINT_COUNT * 2, POINT_COUNT * 3)
+G_SLICE = slice(POINT_COUNT * 3, POINT_COUNT * 3 + 1)
+ZETA_POW_ALPHA_SLICE = slice(POINT_COUNT * 3 + 1, POINT_COUNT * 3 + 2)
+GAMMA_SLICE = slice(POINT_COUNT * 3 + 2, POINT_COUNT * 3 + 3)
+
+
+@dataclass
+class CacheManifest:
+    csv_paths: list[str]
+    file_sizes: list[int]
+    file_mtimes: list[float]
+    total_rows: int
+    total_columns: int = TOTAL_COLUMNS
+    feature_columns: int = FEATURE_COLUMNS
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train a PyTorch MRPNN that matches core/radiancePredict.cu and "
+            "the SIGGRAPH 2023 paper 'Deep Real-time Volumetric Rendering Using Multi-feature Fusion'."
+        )
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="+",
+        required=True,
+        help="One or more CSV files generated in the format of dataGen_MRPNN.cu.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("train/cache"),
+        help="Directory used to store binary caches converted from CSV.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help="Directory used to store checkpoints and logs. Defaults to train/runs/<timestamp>.",
+    )
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=64, help="Paper default.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Paper default.")
+    parser.add_argument(
+        "--final-lr",
+        type=float,
+        default=1e-1,
+        help="AdaBound final learning rate. Paper default.",
+    )
+    parser.add_argument(
+        "--adabound-gamma",
+        type=float,
+        default=1e-3,
+        help="Convergence speed for AdaBound bounds.",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--train-ratio", type=float, default=0.8, help="Paper default: 4:1 split.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision when CUDA is available.")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume from a checkpoint.")
+    parser.add_argument("--prepare-only", action="store_true", help="Only build cache files, then exit.")
+    parser.add_argument("--force-rebuild-cache", action="store_true")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Optional debug cap applied after cache building. 0 means use all rows.",
+    )
+    parser.add_argument("--log-interval", type=int, default=100)
+    return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "cuda":
+        return torch.device("cuda")
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_run_dir(base: Path | None) -> Path:
+    if base is not None:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    run_dir = Path("train/runs") / time.strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(float(seconds), 0.0)
+    whole_seconds = int(total_seconds)
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    centiseconds = int(round((total_seconds - whole_seconds) * 100.0))
+    if centiseconds == 100:
+        secs += 1
+        centiseconds = 0
+        if secs == 60:
+            minutes += 1
+            secs = 0
+            if minutes == 60:
+                hours += 1
+                minutes = 0
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+    return f"{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+
+
+def signature_for_csvs(csv_paths: Sequence[Path]) -> str:
+    payload = []
+    for path in csv_paths:
+        stat = path.stat()
+        payload.append((str(path.resolve()), stat.st_size, stat.st_mtime))
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def count_csv_rows(path: Path) -> int:
+    row_count = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            row_count += 1
+    return row_count
+
+
+def write_manifest(path: Path, manifest: CacheManifest) -> None:
+    path.write_text(json.dumps(asdict(manifest), indent=2), encoding="utf-8")
+
+
+def load_manifest(path: Path) -> CacheManifest:
+    return CacheManifest(**json.loads(path.read_text(encoding="utf-8")))
+
+
+def build_cache(csv_paths: Sequence[Path], cache_dir: Path, force_rebuild: bool = False) -> tuple[Path, Path, CacheManifest]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = signature_for_csvs(csv_paths)
+    feature_path = cache_dir / f"{cache_key}_features.npy"
+    target_path = cache_dir / f"{cache_key}_targets.npy"
+    manifest_path = cache_dir / f"{cache_key}_manifest.json"
+
+    if not force_rebuild and feature_path.exists() and target_path.exists() and manifest_path.exists():
+        manifest = load_manifest(manifest_path)
+        return feature_path, target_path, manifest
+
+    counts = [count_csv_rows(path) for path in csv_paths]
+    total_rows = sum(counts)
+    if total_rows == 0:
+        raise RuntimeError("No valid data rows were found in the provided CSV files.")
+
+    features = np.lib.format.open_memmap(feature_path, mode="w+", dtype=np.float32, shape=(total_rows, FEATURE_COLUMNS))
+    targets = np.lib.format.open_memmap(target_path, mode="w+", dtype=np.float32, shape=(total_rows,))
+
+    cursor = 0
+    write_chunk_size = 4096
+    for path in csv_paths:
+        buffered_rows: list[np.ndarray] = []
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for line in tqdm(handle, desc=f"Caching {path.name}", unit="line"):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                values = np.fromstring(stripped, sep=",", dtype=np.float32)
+                if values.size != TOTAL_COLUMNS:
+                    raise RuntimeError(
+                        f"{path} has a row with {values.size} columns, but MRPNN expects {TOTAL_COLUMNS}."
+                    )
+                buffered_rows.append(values)
+                if len(buffered_rows) >= write_chunk_size:
+                    chunk = np.stack(buffered_rows, axis=0)
+                    next_cursor = cursor + chunk.shape[0]
+                    features[cursor:next_cursor] = chunk[:, :FEATURE_COLUMNS]
+                    targets[cursor:next_cursor] = chunk[:, FEATURE_COLUMNS]
+                    cursor = next_cursor
+                    buffered_rows.clear()
+        if buffered_rows:
+            chunk = np.stack(buffered_rows, axis=0)
+            next_cursor = cursor + chunk.shape[0]
+            features[cursor:next_cursor] = chunk[:, :FEATURE_COLUMNS]
+            targets[cursor:next_cursor] = chunk[:, FEATURE_COLUMNS]
+            cursor = next_cursor
+
+    features.flush()
+    targets.flush()
+
+    manifest = CacheManifest(
+        csv_paths=[str(path.resolve()) for path in csv_paths],
+        file_sizes=[path.stat().st_size for path in csv_paths],
+        file_mtimes=[path.stat().st_mtime for path in csv_paths],
+        total_rows=total_rows,
+    )
+    write_manifest(manifest_path, manifest)
+    return feature_path, target_path, manifest
+
+
+class CachedMRPNNDataset(Dataset):
+    def __init__(self, feature_path: Path, target_path: Path, max_rows: int = 0) -> None:
+        self.features = np.load(feature_path, mmap_mode="r")
+        self.targets = np.load(target_path, mmap_mode="r")
+        if self.features.shape[0] != self.targets.shape[0]:
+            raise RuntimeError("Feature and target row counts do not match.")
+        self.length = self.features.shape[0] if max_rows <= 0 else min(max_rows, self.features.shape[0])
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        feature = np.asarray(self.features[index], dtype=np.float32).copy()
+        target = np.float32(self.targets[index])
+        return torch.from_numpy(feature), torch.tensor(target, dtype=torch.float32)
+
+
+class AdaBound(Optimizer):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        final_lr: float = 0.1,
+        gamma: float = 1e-3,
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        amsbound: bool = False,
+    ) -> None:
+        if lr <= 0.0:
+            raise ValueError("Learning rate must be positive.")
+        if final_lr <= 0.0:
+            raise ValueError("Final learning rate must be positive.")
+        if eps <= 0.0:
+            raise ValueError("Epsilon must be positive.")
+        if gamma <= 0.0:
+            raise ValueError("Gamma must be positive.")
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            final_lr=final_lr,
+            gamma=gamma,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsbound=amsbound,
+        )
+        super().__init__(params, defaults)
+        self.base_lrs = [group["lr"] for group in self.param_groups]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group, base_lr in zip(self.param_groups, self.base_lrs):
+            beta1, beta2 = group["betas"]
+            final_lr = group["final_lr"] * group["lr"] / base_lr
+            amsbound = group["amsbound"]
+
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                grad = param.grad
+                if grad.is_sparse:
+                    raise RuntimeError("AdaBound does not support sparse gradients.")
+
+                state = self.state[param]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                    if amsbound:
+                        state["max_exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                step = state["step"]
+
+                if group["weight_decay"] != 0:
+                    grad = grad.add(param, alpha=group["weight_decay"])
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                if amsbound:
+                    max_exp_avg_sq = state["max_exp_avg_sq"]
+                    torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+                    denom = max_exp_avg_sq.sqrt().add_(group["eps"])
+                else:
+                    denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1
+
+                lower_bound = final_lr * (1 - 1 / (group["gamma"] * step + 1))
+                upper_bound = final_lr * (1 + 1 / (group["gamma"] * step))
+                bounded_step = torch.full_like(denom, step_size).div_(denom)
+                bounded_step.clamp_(min=lower_bound, max=upper_bound)
+                param.addcmul_(exp_avg, bounded_step, value=-1.0)
+
+        return loss
+
+
+class SEModule(nn.Module):
+    def __init__(self, in_dim: int = 8, hidden_dim: int = 8, out_dim: int = 3) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x), inplace=False)
+        return torch.sigmoid(self.fc2(x))
+
+
+class GlobalSEModule(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(75, 16, bias=False)
+        self.fc2 = nn.Linear(16, 6, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x), inplace=False)
+        return torch.sigmoid(self.fc2(x))
+
+
+class MRPNN(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.low_se = nn.ModuleList(SEModule() for _ in LOW_GROUPS)
+        self.high_se = nn.ModuleList(SEModule() for _ in HIGH_GROUPS)
+
+        self.low_density = nn.ModuleList(nn.Linear(size, size) for size in LOW_SIZES)
+        self.low_transmittance = nn.ModuleList(nn.Linear(size, size) for size in LOW_SIZES)
+        self.low_phase = nn.ModuleList(nn.Linear(size, size) for size in LOW_SIZES)
+        self.low_head_density = nn.Linear(32, 32)
+        self.low_head_transmittance = nn.Linear(32, 32)
+        self.low_head_phase = nn.Linear(32, 32)
+
+        self.high_density = nn.ModuleList(nn.Linear(size, size) for size in HIGH_SIZES)
+        self.high_transmittance = nn.ModuleList(nn.Linear(size, size) for size in HIGH_SIZES)
+        self.high_phase = nn.ModuleList(nn.Linear(size, size) for size in HIGH_SIZES)
+        self.high_head_density = nn.Linear(8, 8)
+        self.high_head_transmittance = nn.Linear(8, 8)
+        self.high_head_phase = nn.Linear(8, 8)
+
+        self.global_embed = nn.Linear(3, 8)
+        self.global_se = GlobalSEModule()
+
+        self.lc0 = nn.Linear(128, 128)
+        self.lc1 = nn.Linear(128, 64)
+        self.lc2 = nn.Linear(64, 32)
+        self.lx = nn.Linear(32, 16)
+
+        self.residual_blocks = nn.ModuleList(
+            nn.ModuleList([nn.Linear(16, 16), nn.Linear(16, 16)]) for _ in range(6)
+        )
+        self.output_layer = nn.Linear(16, 1)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.reset_parameters()
+
+    @staticmethod
+    def _stats_triplet(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        avg = torch.cat([a.mean(dim=1, keepdim=True), b.mean(dim=1, keepdim=True), c.mean(dim=1, keepdim=True)], dim=1)
+        mx = torch.cat([a.amax(dim=1, keepdim=True), b.amax(dim=1, keepdim=True), c.amax(dim=1, keepdim=True)], dim=1)
+        return avg, mx
+
+    @staticmethod
+    def _relu_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(linear(x), inplace=False)
+
+    def forward_log_radiance(self, features: torch.Tensor) -> torch.Tensor:
+        density = features[:, DENSITY_SLICE]
+        transmittance = features[:, TRANSMITTANCE_SLICE]
+        phase = features[:, PHASE_SLICE]
+        g = features[:, G_SLICE]
+        zeta_pow_alpha = features[:, ZETA_POW_ALPHA_SLICE]
+        gamma = features[:, GAMMA_SLICE]
+
+        avg_stats: list[torch.Tensor] = []
+        max_stats: list[torch.Tensor] = []
+
+        low_d_state: torch.Tensor | None = None
+        low_t_state: torch.Tensor | None = None
+        low_p_state: torch.Tensor | None = None
+
+        for group_index, (start, end) in enumerate(LOW_GROUPS):
+            d_slice = density[:, start:end]
+            t_slice = transmittance[:, start:end]
+            p_slice = phase[:, start:end]
+
+            avg, mx = self._stats_triplet(d_slice, t_slice, p_slice)
+            avg_stats.append(avg)
+            max_stats.append(mx)
+            gate = self.low_se[group_index](torch.cat([avg, mx, g, gamma], dim=1))
+
+            gated_d = d_slice * gate[:, 0:1]
+            gated_t = t_slice * gate[:, 1:2]
+            gated_p = p_slice * gate[:, 2:3]
+
+            if group_index == 0:
+                low_d_state = self._relu_linear(self.low_density[group_index], gated_d) + d_slice
+                low_t_state = self._relu_linear(self.low_transmittance[group_index], gated_t) + t_slice
+                low_p_state = self._relu_linear(self.low_phase[group_index], gated_p) + p_slice
+            elif group_index == 1:
+                out_d = self._relu_linear(self.low_density[group_index], gated_d + low_d_state)
+                out_t = self._relu_linear(self.low_transmittance[group_index], gated_t + low_t_state)
+                out_p = self._relu_linear(self.low_phase[group_index], gated_p + low_p_state)
+                low_d_state = torch.cat([out_d, d_slice], dim=1)
+                low_t_state = torch.cat([out_t, t_slice], dim=1)
+                low_p_state = torch.cat([out_p, p_slice], dim=1)
+            elif group_index in (2, 3):
+                low_d_state = self._relu_linear(self.low_density[group_index], gated_d + low_d_state) + d_slice
+                low_t_state = self._relu_linear(self.low_transmittance[group_index], gated_t + low_t_state) + t_slice
+                low_p_state = self._relu_linear(self.low_phase[group_index], gated_p + low_p_state) + p_slice
+            elif group_index == 4:
+                out_d = self._relu_linear(self.low_density[group_index], gated_d + low_d_state)
+                out_t = self._relu_linear(self.low_transmittance[group_index], gated_t + low_t_state)
+                out_p = self._relu_linear(self.low_phase[group_index], gated_p + low_p_state)
+                low_d_state = torch.cat([out_d, d_slice], dim=1)
+                low_t_state = torch.cat([out_t, t_slice], dim=1)
+                low_p_state = torch.cat([out_p, p_slice], dim=1)
+            else:
+                low_d_state = self._relu_linear(self.low_density[group_index], gated_d + low_d_state) + d_slice
+                low_t_state = self._relu_linear(self.low_transmittance[group_index], gated_t + low_t_state) + t_slice
+                low_p_state = self._relu_linear(self.low_phase[group_index], gated_p + low_p_state) + p_slice
+
+        low_density_out = self._relu_linear(self.low_head_density, low_d_state)
+        low_transmittance_out = self._relu_linear(self.low_head_transmittance, low_t_state)
+        low_phase_out = self._relu_linear(self.low_head_phase, low_p_state)
+
+        high_d_state: torch.Tensor | None = None
+        high_t_state: torch.Tensor | None = None
+        high_p_state: torch.Tensor | None = None
+
+        for group_index, (start, end) in enumerate(HIGH_GROUPS):
+            d_slice = density[:, start:end]
+            t_slice = transmittance[:, start:end]
+            p_slice = phase[:, start:end]
+
+            avg, mx = self._stats_triplet(d_slice, t_slice, p_slice)
+            avg_stats.append(avg)
+            max_stats.append(mx)
+            gate = self.high_se[group_index](torch.cat([avg, mx, g, gamma], dim=1))
+
+            gated_d = d_slice * gate[:, 0:1]
+            gated_t = t_slice * gate[:, 1:2]
+            gated_p = p_slice * gate[:, 2:3]
+
+            if group_index == 0:
+                high_d_state = self._relu_linear(self.high_density[group_index], gated_d) + d_slice
+                high_t_state = self._relu_linear(self.high_transmittance[group_index], gated_t) + t_slice
+                high_p_state = self._relu_linear(self.high_phase[group_index], gated_p) + p_slice
+            else:
+                high_d_state = self._relu_linear(self.high_density[group_index], gated_d + high_d_state) + d_slice
+                high_t_state = self._relu_linear(self.high_transmittance[group_index], gated_t + high_t_state) + t_slice
+                high_p_state = self._relu_linear(self.high_phase[group_index], gated_p + high_p_state) + p_slice
+
+        high_density_out = self._relu_linear(self.high_head_density, high_d_state)
+        high_transmittance_out = self._relu_linear(self.high_head_transmittance, high_t_state)
+        high_phase_out = self._relu_linear(self.high_head_phase, high_p_state)
+
+        stats = torch.cat(
+            [
+                torch.cat(avg_stats, dim=1),
+                torch.cat(max_stats, dim=1),
+                g,
+                gamma,
+                zeta_pow_alpha,
+            ],
+            dim=1,
+        )
+
+        comb = torch.cat(
+            [
+                low_density_out,
+                low_transmittance_out,
+                low_phase_out,
+                high_density_out,
+                high_transmittance_out,
+                high_phase_out,
+                self._relu_linear(self.global_embed, torch.cat([g, gamma, zeta_pow_alpha], dim=1)),
+            ],
+            dim=1,
+        )
+
+        global_gate = self.global_se(stats)
+        comb = torch.cat(
+            [
+                comb[:, 0:32] * global_gate[:, 0:1],
+                comb[:, 32:64] * global_gate[:, 1:2],
+                comb[:, 64:96] * global_gate[:, 2:3],
+                comb[:, 96:104] * global_gate[:, 3:4],
+                comb[:, 104:112] * global_gate[:, 4:5],
+                comb[:, 112:120] * global_gate[:, 5:6],
+                comb[:, 120:128],
+            ],
+            dim=1,
+        )
+
+        x = self._relu_linear(self.lc0, comb)
+        x = self._relu_linear(self.lc1, x)
+        x = self._relu_linear(self.lc2, x)
+        x = self._relu_linear(self.lx, x)
+
+        for first, second in self.residual_blocks:
+            x = x + self._relu_linear(second, self._relu_linear(first, x))
+
+        return self.output_layer(x).squeeze(1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.forward_log_radiance(features)
+
+    def decode_raw_radiance(self, features: torch.Tensor, log_radiance: torch.Tensor) -> torch.Tensor:
+        zeta_pow_alpha = features[:, ZETA_POW_ALPHA_SLICE].squeeze(1)
+        log_radiance = torch.clamp(log_radiance, min=0.0)
+        return torch.clamp(torch.exp(log_radiance) - 1.0, min=0.0) * zeta_pow_alpha
+
+
+def target_to_log(target_raw: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    zeta_pow_alpha = torch.clamp(features[:, ZETA_POW_ALPHA_SLICE].squeeze(1), min=1e-8)
+    return torch.log1p(target_raw / zeta_pow_alpha)
+
+
+def rmse(pred: torch.Tensor, target: torch.Tensor) -> float:
+    return torch.sqrt(torch.mean((pred - target) ** 2)).item()
+
+
+def build_split_indices(length: int, train_ratio: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    indices = np.arange(length)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(indices)
+    train_size = int(length * train_ratio)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    if len(train_indices) == 0 or len(val_indices) == 0:
+        raise RuntimeError("Train/validation split is empty. Adjust --train-ratio or dataset size.")
+    return train_indices, val_indices
+
+
+def save_metrics_csv(path: Path, records: list[dict[str, float]]) -> None:
+    if not records:
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def serialize_checkpoint_value(value: object) -> object:
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, dict):
+        return {key: serialize_checkpoint_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [serialize_checkpoint_value(item) for item in value]
+    if isinstance(value, list):
+        return [serialize_checkpoint_value(item) for item in value]
+    return value
+
+
+def save_checkpoint(
+    path: Path,
+    model: MRPNN,
+    optimizer: Optimizer,
+    epoch: int,
+    best_val_loss: float,
+    args: argparse.Namespace,
+) -> None:
+    checkpoint = {
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "args": serialize_checkpoint_value(vars(args)),
+    }
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(path: Path, model: MRPNN, optimizer: Optimizer | None = None) -> tuple[int, float]:
+    checkpoint = torch.load(path, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state"])
+    if optimizer is not None and "optimizer_state" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    return int(checkpoint.get("epoch", 0)), float(checkpoint.get("best_val_loss", float("inf")))
+
+
+def evaluate(
+    model: MRPNN,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    all_pred_raw = []
+    all_target_raw = []
+
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    amp_enabled = use_amp and device.type == "cuda"
+
+    with torch.no_grad():
+        for features, target_raw in loader:
+            features = features.to(device, non_blocking=True)
+            target_raw = target_raw.to(device, non_blocking=True)
+            with torch.autocast(device_type=autocast_device, enabled=amp_enabled):
+                pred_log = model(features)
+                target_log = target_to_log(target_raw, features)
+                loss = F.mse_loss(pred_log, target_log, reduction="sum")
+
+            total_loss += loss.item()
+            total_samples += features.size(0)
+            all_pred_raw.append(model.decode_raw_radiance(features, pred_log).float().cpu())
+            all_target_raw.append(target_raw.float().cpu())
+
+    mean_loss = total_loss / total_samples
+    pred_raw = torch.cat(all_pred_raw, dim=0)
+    target_raw = torch.cat(all_target_raw, dim=0)
+    return mean_loss, rmse(pred_raw, target_raw)
+
+
+def train_one_epoch(
+    model: MRPNN,
+    loader: DataLoader,
+    optimizer: Optimizer,
+    device: torch.device,
+    scaler: torch.cuda.amp.GradScaler | None,
+    use_amp: bool,
+    log_interval: int,
+    epoch: int,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    amp_enabled = use_amp and device.type == "cuda"
+
+    progress = tqdm(loader, desc=f"Epoch {epoch:03d}", unit="batch")
+    for step, (features, target_raw) in enumerate(progress, start=1):
+        features = features.to(device, non_blocking=True)
+        target_raw = target_raw.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=autocast_device, enabled=amp_enabled):
+            pred_log = model(features)
+            target_log = target_to_log(target_raw, features)
+            loss = F.mse_loss(pred_log, target_log)
+
+        if scaler is not None and amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        batch_size = features.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        if step % log_interval == 0 or step == len(loader):
+            progress.set_postfix(loss=total_loss / total_samples)
+
+    return total_loss / total_samples
+
+
+def main() -> None:
+    script_start_time = time.perf_counter()
+    args = parse_args()
+    set_seed(args.seed)
+
+    csv_paths = [Path(path) for path in args.csv]
+    for path in csv_paths:
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+    cache_start_time = time.perf_counter()
+    feature_path, target_path, manifest = build_cache(
+        csv_paths=csv_paths,
+        cache_dir=args.cache_dir,
+        force_rebuild=args.force_rebuild_cache,
+    )
+    cache_seconds = time.perf_counter() - cache_start_time
+    print(f"Cache ready: {manifest.total_rows} rows")
+    print(f"Features: {feature_path}")
+    print(f"Targets : {target_path}")
+
+    if args.prepare_only:
+        total_seconds = time.perf_counter() - script_start_time
+        print(f"Total time  : {format_duration(total_seconds)}")
+        return
+
+    dataset = CachedMRPNNDataset(feature_path, target_path, max_rows=args.max_rows)
+    train_indices, val_indices = build_split_indices(len(dataset), args.train_ratio, args.seed)
+    train_set = Subset(dataset, train_indices.tolist())
+    val_set = Subset(dataset, val_indices.tolist())
+
+    device = resolve_device(args.device)
+    run_dir = make_run_dir(args.save_dir)
+    (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
+
+    loader_kwargs = dict(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
+    train_loader = DataLoader(train_set, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_set, shuffle=False, **loader_kwargs)
+
+    model = MRPNN().to(device)
+    optimizer = AdaBound(
+        model.parameters(),
+        lr=args.lr,
+        final_lr=args.final_lr,
+        gamma=args.adabound_gamma,
+        weight_decay=args.weight_decay,
+    )
+
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if args.resume is not None:
+        resumed_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer)
+        start_epoch = resumed_epoch + 1
+        print(f"Resumed from {args.resume} at epoch {resumed_epoch}")
+
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    metrics: list[dict[str, float]] = []
+
+    print(f"Device      : {device}")
+    print(f"Train rows   : {len(train_set)}")
+    print(f"Val rows     : {len(val_set)}")
+    print(f"Batch size   : {args.batch_size}")
+    print(f"Optimizer    : AdaBound(lr={args.lr}, final_lr={args.final_lr}, gamma={args.adabound_gamma})")
+    print("Loss         : MSE(log(Shat / zeta^alpha + 1), log(S / zeta^alpha + 1)) with alpha=4 embedded in CSV")
+    print("Output head  : linear during training; decode clamps log-radiance to match CUDA ReLU inference")
+
+    training_start_time = time.perf_counter()
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            scaler=scaler,
+            use_amp=args.amp,
+            log_interval=args.log_interval,
+            epoch=epoch,
+        )
+        val_loss, val_rmse_raw = evaluate(
+            model=model,
+            loader=val_loader,
+            device=device,
+            use_amp=args.amp,
+        )
+        record = {
+            "epoch": float(epoch),
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "val_rmse_raw": float(val_rmse_raw),
+        }
+        metrics.append(record)
+        save_metrics_csv(run_dir / "metrics.csv", metrics)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(run_dir / "best.pt", model, optimizer, epoch, best_val_loss, args)
+        save_checkpoint(run_dir / "latest.pt", model, optimizer, epoch, best_val_loss, args)
+
+        print(
+            f"[Epoch {epoch:03d}] "
+            f"train_loss={train_loss:.8f} "
+            f"val_loss={val_loss:.8f} "
+            f"val_rmse_raw={val_rmse_raw:.8f} "
+            f"best_val_loss={best_val_loss:.8f}"
+        )
+
+    training_seconds = time.perf_counter() - training_start_time
+    total_seconds = time.perf_counter() - script_start_time
+    timing_summary = {
+        "cache_seconds": cache_seconds,
+        "training_seconds": training_seconds,
+        "total_seconds": total_seconds,
+        "cache_hms": format_duration(cache_seconds),
+        "training_hms": format_duration(training_seconds),
+        "total_hms": format_duration(total_seconds),
+    }
+    (run_dir / "timing.json").write_text(json.dumps(timing_summary, indent=2), encoding="utf-8")
+    print(f"Training time: {format_duration(training_seconds)}")
+    print(f"Total time   : {format_duration(total_seconds)}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+

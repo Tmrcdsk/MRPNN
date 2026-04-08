@@ -50,9 +50,9 @@ float CompareBias(string path, string name, string path2, string name2) {
 
 int main()
 {
-    string GT_path = "./Results/GT/";
-    string predict_path = "./Results/";
-    string test_path = "./TestCase/";
+    string GT_path = "../Results/GT/";
+    string predict_path = "../Results/";
+    string test_path = "../TestCase/";
 
     int sample_num = 1024;
     VolumeRender::RenderType RunType = VolumeRender::RenderType::MRPNN;
