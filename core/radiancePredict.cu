@@ -302,7 +302,7 @@ __device__ inline void Rep(float* A, const float* B, const int Size, const int A
 // ---------------------------------------------------------
 // Networks
 // ---------------------------------------------------------
-#include "NNWeight_500000.cuh"
+#include "NNWeight.cuh"
 
 __device__ float3 RadiancePredict(curandState* seed, bool active, float3 pos, float3 LightDir, float3 XMain, float3 YMain, float3 ZMain, float3 LXMain, float3 LYMain, float3 LZMain, float alpha, float g, float3 scatterrate)
 {

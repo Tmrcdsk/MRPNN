@@ -14,11 +14,12 @@
 
 namespace {
 
-constexpr int COUNT_ALL = 500000;
-
 constexpr int kStencilPointCount = 192;
 constexpr int kOutputColumns = kStencilPointCount * 3 + 4;
-constexpr int kConditionBatchSize = 256;
+constexpr int kSamplesPerModel = 250000;
+constexpr int kConditionCountPerModel = 50;
+constexpr int kSamplesPerCondition = kSamplesPerModel / kConditionCountPerModel;
+static_assert(kSamplesPerModel % kConditionCountPerModel == 0, "Paper sampling requires an integer number of samples per condition.");
 constexpr int kPathTraceScatterCount = 512;
 constexpr int kPathTraceSampleCount = 1024;
 constexpr float kMaxG = 0.857f;
@@ -439,6 +440,69 @@ __global__ void ExtractMRPNNDescriptorKernel(
     rows[idx] = row;
 }
 
+void AppendGpuDescriptorRows(
+    VolumeRender& volume,
+    const std::vector<MRPNNSamplePoint>& samples,
+    const std::vector<float3>& predictRadiances,
+    std::vector<MRPNNDescriptorRow>& rows) {
+    if (samples.empty()) {
+        return;
+    }
+    if (samples.size() != predictRadiances.size()) {
+        std::cerr << "Descriptor extraction failed: sample/target count mismatch.\n";
+        std::exit(EXIT_FAILURE);
+    }
+
+    std::vector<BasisPair> bases(samples.size());
+    for (size_t i = 0; i < samples.size(); i++) {
+        bases[i] = BasisPair{GetMatrixFromNormalHost(samples[i].viewDir), GetMatrixFromNormalHost(samples[i].lightDir)};
+    }
+
+    MRPNNSamplePoint* deviceSamples = nullptr;
+    BasisPair* deviceBases = nullptr;
+    DeviceDescriptorRow* deviceRows = nullptr;
+    CheckCudaOrDie(cudaMalloc(&deviceSamples, sizeof(MRPNNSamplePoint) * samples.size()), "cudaMalloc(deviceSamples)");
+    CheckCudaOrDie(cudaMalloc(&deviceBases, sizeof(BasisPair) * bases.size()), "cudaMalloc(deviceBases)");
+    CheckCudaOrDie(cudaMalloc(&deviceRows, sizeof(DeviceDescriptorRow) * samples.size()), "cudaMalloc(deviceRows)");
+
+    CheckCudaOrDie(cudaMemcpy(deviceSamples, samples.data(), sizeof(MRPNNSamplePoint) * samples.size(), cudaMemcpyHostToDevice), "cudaMemcpy(samples)");
+    CheckCudaOrDie(cudaMemcpy(deviceBases, bases.data(), sizeof(BasisPair) * bases.size(), cudaMemcpyHostToDevice), "cudaMemcpy(bases)");
+
+    for (size_t i = 0; i < samples.size(); i++) {
+        volume.UpdateHGLut(samples[i].g);
+        ExtractMRPNNDescriptorKernel<<<1, 1>>>(
+            deviceSamples + i,
+            deviceBases + i,
+            deviceRows + i,
+            1);
+        CheckCudaOrDie(cudaGetLastError(), "ExtractMRPNNDescriptorKernel launch");
+        CheckCudaOrDie(cudaDeviceSynchronize(), "ExtractMRPNNDescriptorKernel sync");
+    }
+
+    std::vector<DeviceDescriptorRow> gpuRows(samples.size());
+    CheckCudaOrDie(cudaMemcpy(gpuRows.data(), deviceRows, sizeof(DeviceDescriptorRow) * samples.size(), cudaMemcpyDeviceToHost), "cudaMemcpy(deviceRows)");
+
+    cudaFree(deviceSamples);
+    cudaFree(deviceBases);
+    cudaFree(deviceRows);
+
+    rows.reserve(rows.size() + samples.size());
+    for (size_t sampleIndex = 0; sampleIndex < samples.size(); sampleIndex++) {
+        MRPNNDescriptorRow row;
+        const DeviceDescriptorRow& gpu = gpuRows[sampleIndex];
+        for (int featureIndex = 0; featureIndex < kStencilPointCount; featureIndex++) {
+            row.density[featureIndex] = gpu.density[featureIndex];
+            row.transmittance[featureIndex] = gpu.transmittance[featureIndex];
+            row.phase[featureIndex] = gpu.phase[featureIndex];
+        }
+        row.g = samples[sampleIndex].g;
+        row.zetaPowAlpha = std::pow(samples[sampleIndex].albedo, kAlbedoExponent);
+        row.gamma = gpu.gamma;
+        row.targetPredictRadiance = std::max(predictRadiances[sampleIndex].x, 0.0f);
+        rows.push_back(row);
+    }
+}
+
 bool RunDescriptorValidation(const std::string& volumePath, const std::string& volumeName, int sampleCount) {
     std::cout << "Validating descriptor parity for " << volumeName << "\n";
 
@@ -581,6 +645,139 @@ bool RunDescriptorValidation(const std::string& volumePath, const std::string& v
     return passed;
 }
 
+struct DiffStats {
+    std::vector<float> values;
+    double sum = 0.0;
+    float maxValue = 0.0f;
+    int maxSampleIndex = -1;
+    int maxFeatureIndex = -1;
+
+    void add(float value, int sampleIndex, int featureIndex) {
+        values.push_back(value);
+        sum += value;
+        if (value > maxValue) {
+            maxValue = value;
+            maxSampleIndex = sampleIndex;
+            maxFeatureIndex = featureIndex;
+        }
+    }
+
+    float mean() const {
+        return values.empty() ? 0.0f : static_cast<float>(sum / static_cast<double>(values.size()));
+    }
+
+    float percentile(float p) {
+        if (values.empty()) {
+            return 0.0f;
+        }
+        const size_t index = static_cast<size_t>(std::clamp(p, 0.0f, 1.0f) * static_cast<float>(values.size() - 1));
+        std::nth_element(values.begin(), values.begin() + index, values.end());
+        return values[index];
+    }
+
+    void print(const char* name) {
+        const float p95 = percentile(0.95f);
+        const float p99 = percentile(0.99f);
+        std::cout << "  " << name
+                  << " mean=" << mean()
+                  << " p95=" << p95
+                  << " p99=" << p99
+                  << " max=" << maxValue
+                  << " at sample " << maxSampleIndex;
+        if (maxFeatureIndex >= 0) {
+            std::cout << ", feature " << maxFeatureIndex;
+        }
+        std::cout << "\n";
+    }
+};
+
+bool RunSkewValidation(const std::string& volumePath, const std::string& volumeName, int sampleCount) {
+    std::cout << "Validating host/GPU descriptor skew for " << volumeName << "\n";
+
+    VolumeRender volume(volumePath);
+    const float3 lightDir = hash31sphere();
+    const float epsilon = lerp(kEpsilonMin, kEpsilonMax, hash1());
+    const float g = lerp(0.0f, kMaxG, hash1());
+
+    volume.UpdateHGLut(g);
+    volume.Update_TR(lightDir, epsilon, true);
+
+    std::vector<MRPNNSamplePoint> samples;
+    GetDesiredCountSample(volume, samples, sampleCount, epsilon, g, lightDir);
+    if (samples.empty()) {
+        std::cerr << "Skew validation failed: no samples generated.\n";
+        return false;
+    }
+
+    std::vector<BasisPair> bases(samples.size());
+    std::vector<MRPNNDescriptorRow> hostRows;
+    hostRows.reserve(samples.size());
+    for (size_t i = 0; i < samples.size(); i++) {
+        bases[i] = BasisPair{GetMatrixFromNormalHost(samples[i].viewDir), GetMatrixFromNormalHost(samples[i].lightDir)};
+        hostRows.push_back(BuildDescriptorRow(volume, samples[i], 0.0f, bases[i]));
+    }
+
+    MRPNNSamplePoint* deviceSamples = nullptr;
+    BasisPair* deviceBases = nullptr;
+    DeviceDescriptorRow* deviceRows = nullptr;
+    CheckCudaOrDie(cudaMalloc(&deviceSamples, sizeof(MRPNNSamplePoint) * samples.size()), "cudaMalloc(deviceSamples)");
+    CheckCudaOrDie(cudaMalloc(&deviceBases, sizeof(BasisPair) * bases.size()), "cudaMalloc(deviceBases)");
+    CheckCudaOrDie(cudaMalloc(&deviceRows, sizeof(DeviceDescriptorRow) * samples.size()), "cudaMalloc(deviceRows)");
+
+    CheckCudaOrDie(cudaMemcpy(deviceSamples, samples.data(), sizeof(MRPNNSamplePoint) * samples.size(), cudaMemcpyHostToDevice), "cudaMemcpy(samples)");
+    CheckCudaOrDie(cudaMemcpy(deviceBases, bases.data(), sizeof(BasisPair) * bases.size(), cudaMemcpyHostToDevice), "cudaMemcpy(bases)");
+
+    const int threads = 64;
+    const int blocks = static_cast<int>((samples.size() + threads - 1) / threads);
+    ExtractMRPNNDescriptorKernel<<<blocks, threads>>>(deviceSamples, deviceBases, deviceRows, static_cast<int>(samples.size()));
+    CheckCudaOrDie(cudaGetLastError(), "ExtractMRPNNDescriptorKernel launch");
+    CheckCudaOrDie(cudaDeviceSynchronize(), "ExtractMRPNNDescriptorKernel sync");
+
+    std::vector<DeviceDescriptorRow> gpuRows(samples.size());
+    CheckCudaOrDie(cudaMemcpy(gpuRows.data(), deviceRows, sizeof(DeviceDescriptorRow) * samples.size(), cudaMemcpyDeviceToHost), "cudaMemcpy(deviceRows)");
+
+    cudaFree(deviceSamples);
+    cudaFree(deviceBases);
+    cudaFree(deviceRows);
+
+    DiffStats densityStats;
+    DiffStats transmittanceStats;
+    DiffStats phaseStats;
+    DiffStats gammaStats;
+    densityStats.values.reserve(samples.size() * kStencilPointCount);
+    transmittanceStats.values.reserve(samples.size() * kStencilPointCount);
+    phaseStats.values.reserve(samples.size() * kStencilPointCount);
+    gammaStats.values.reserve(samples.size());
+
+    for (size_t sampleIndex = 0; sampleIndex < samples.size(); sampleIndex++) {
+        const MRPNNDescriptorRow& host = hostRows[sampleIndex];
+        const DeviceDescriptorRow& gpu = gpuRows[sampleIndex];
+        gammaStats.add(std::abs(host.gamma - gpu.gamma), static_cast<int>(sampleIndex), -1);
+        for (int featureIndex = 0; featureIndex < kStencilPointCount; featureIndex++) {
+            densityStats.add(std::abs(host.density[featureIndex] - gpu.density[featureIndex]), static_cast<int>(sampleIndex), featureIndex);
+            transmittanceStats.add(std::abs(host.transmittance[featureIndex] - gpu.transmittance[featureIndex]), static_cast<int>(sampleIndex), featureIndex);
+            phaseStats.add(std::abs(host.phase[featureIndex] - gpu.phase[featureIndex]), static_cast<int>(sampleIndex), featureIndex);
+        }
+    }
+
+    std::cout << "  condition: epsilon=" << epsilon
+              << " g=" << g
+              << " lightDir=(" << lightDir.x << ", " << lightDir.y << ", " << lightDir.z << ")"
+              << " samples=" << samples.size() << "\n";
+    densityStats.print("density abs diff");
+    transmittanceStats.print("transmittance abs diff");
+    phaseStats.print("phase abs diff");
+    gammaStats.print("gamma abs diff");
+
+    const bool lowSkew =
+        densityStats.percentile(0.95f) <= 2e-2f &&
+        transmittanceStats.percentile(0.95f) <= 5e-3f &&
+        phaseStats.percentile(0.95f) <= 1e-2f &&
+        gammaStats.maxValue <= 1e-5f;
+    std::cout << "  feature-skew risk: " << (lowSkew ? "LOW" : "NEEDS MODEL-SENSITIVITY CHECK") << "\n";
+    return lowSkew;
+}
+
 bool RunTargetValidation(const std::string& volumePath, const std::string& volumeName, int sampleCount) {
     std::cout << "Validating target definition for " << volumeName << "\n";
 
@@ -690,6 +887,122 @@ void WriteRow(std::ofstream& outfile, const MRPNNDescriptorRow& row) {
     outfile << std::setiosflags(std::ios::fixed) << row.targetPredictRadiance << "\n";
 }
 
+void DumpPairedDescriptorsForVolume(
+    const std::string& volumePath,
+    const std::string& volumeName,
+    int sampleCount,
+    std::ofstream& hostOutfile,
+    std::ofstream& gpuOutfile) {
+    std::cout << "Dumping paired descriptors for " << volumeName << "\n";
+
+    VolumeRender volume(volumePath);
+    const float3 lightDir = hash31sphere();
+    const float epsilon = lerp(kEpsilonMin, kEpsilonMax, hash1());
+
+    volume.Update_TR(lightDir, epsilon, true);
+
+    std::vector<MRPNNSamplePoint> samples;
+    samples.reserve(sampleCount);
+    while (static_cast<int>(samples.size()) < sampleCount) {
+        const float g = lerp(0.0f, kMaxG, hash1());
+        std::vector<MRPNNSamplePoint> oneSample;
+        GetDesiredCountSample(volume, oneSample, 1, epsilon, g, lightDir);
+        if (!oneSample.empty()) {
+            samples.push_back(oneSample.front());
+        }
+    }
+
+    std::vector<float3> samplePositions;
+    std::vector<float3> sampleDirs;
+    std::vector<float3> sampleLightDirs;
+    std::vector<float> sampleEpsilons;
+    std::vector<float> sampleGs;
+    std::vector<float> sampleScatters;
+    samplePositions.reserve(samples.size());
+    sampleDirs.reserve(samples.size());
+    sampleLightDirs.reserve(samples.size());
+    sampleEpsilons.reserve(samples.size());
+    sampleGs.reserve(samples.size());
+    sampleScatters.reserve(samples.size());
+    for (const MRPNNSamplePoint& sample : samples) {
+        samplePositions.push_back(sample.position);
+        sampleDirs.push_back(sample.viewDir);
+        sampleLightDirs.push_back(sample.lightDir);
+        sampleEpsilons.push_back(sample.epsilon);
+        sampleGs.push_back(sample.g);
+        sampleScatters.push_back(sample.albedo);
+    }
+
+    const float3 lightColor = {1.0f, 1.0f, 1.0f};
+    const std::vector<float3> predictRadiances = volume.GetSamples(
+        sampleEpsilons,
+        samplePositions,
+        sampleDirs,
+        sampleLightDirs,
+        sampleGs,
+        sampleScatters,
+        lightColor,
+        kPathTraceScatterCount,
+        kPathTraceSampleCount);
+
+    std::vector<BasisPair> bases(samples.size());
+    for (size_t i = 0; i < samples.size(); i++) {
+        bases[i] = BasisPair{GetMatrixFromNormalHost(samples[i].viewDir), GetMatrixFromNormalHost(samples[i].lightDir)};
+    }
+
+    MRPNNSamplePoint* deviceSamples = nullptr;
+    BasisPair* deviceBases = nullptr;
+    DeviceDescriptorRow* deviceRows = nullptr;
+    CheckCudaOrDie(cudaMalloc(&deviceSamples, sizeof(MRPNNSamplePoint) * samples.size()), "cudaMalloc(deviceSamples)");
+    CheckCudaOrDie(cudaMalloc(&deviceBases, sizeof(BasisPair) * bases.size()), "cudaMalloc(deviceBases)");
+    CheckCudaOrDie(cudaMalloc(&deviceRows, sizeof(DeviceDescriptorRow) * samples.size()), "cudaMalloc(deviceRows)");
+
+    CheckCudaOrDie(cudaMemcpy(deviceSamples, samples.data(), sizeof(MRPNNSamplePoint) * samples.size(), cudaMemcpyHostToDevice), "cudaMemcpy(samples)");
+    CheckCudaOrDie(cudaMemcpy(deviceBases, bases.data(), sizeof(BasisPair) * bases.size(), cudaMemcpyHostToDevice), "cudaMemcpy(bases)");
+
+    for (size_t sampleIndex = 0; sampleIndex < samples.size(); sampleIndex++) {
+        volume.UpdateHGLut(samples[sampleIndex].g);
+
+        const MRPNNDescriptorRow hostRow = BuildDescriptorRow(
+            volume,
+            samples[sampleIndex],
+            predictRadiances[sampleIndex].x,
+            bases[sampleIndex]);
+        WriteRow(hostOutfile, hostRow);
+
+        ExtractMRPNNDescriptorKernel<<<1, 1>>>(
+            deviceSamples + sampleIndex,
+            deviceBases + sampleIndex,
+            deviceRows + sampleIndex,
+            1);
+        CheckCudaOrDie(cudaGetLastError(), "ExtractMRPNNDescriptorKernel launch");
+        CheckCudaOrDie(cudaDeviceSynchronize(), "ExtractMRPNNDescriptorKernel sync");
+
+        DeviceDescriptorRow gpu = {};
+        CheckCudaOrDie(cudaMemcpy(&gpu, deviceRows + sampleIndex, sizeof(DeviceDescriptorRow), cudaMemcpyDeviceToHost), "cudaMemcpy(one device row)");
+
+        MRPNNDescriptorRow gpuRow;
+        for (int featureIndex = 0; featureIndex < kStencilPointCount; featureIndex++) {
+            gpuRow.density[featureIndex] = gpu.density[featureIndex];
+            gpuRow.transmittance[featureIndex] = gpu.transmittance[featureIndex];
+            gpuRow.phase[featureIndex] = gpu.phase[featureIndex];
+        }
+        gpuRow.g = samples[sampleIndex].g;
+        gpuRow.zetaPowAlpha = std::pow(samples[sampleIndex].albedo, kAlbedoExponent);
+        gpuRow.gamma = gpu.gamma;
+        gpuRow.targetPredictRadiance = std::max(predictRadiances[sampleIndex].x, 0.0f);
+        WriteRow(gpuOutfile, gpuRow);
+    }
+
+    cudaFree(deviceSamples);
+    cudaFree(deviceBases);
+    cudaFree(deviceRows);
+
+    std::cout << "  dumped rows: " << samples.size()
+              << " epsilon=" << epsilon
+              << " lightDir=(" << lightDir.x << ", " << lightDir.y << ", " << lightDir.z << ")\n";
+}
+
 namespace fs = std::filesystem;
 
 static void CollectVolFiles(const fs::path& dir, std::vector<std::string>& list)
@@ -717,17 +1030,43 @@ static void CollectVolFiles(const fs::path& dir, std::vector<std::string>& list)
 int main(int argc, char** argv) {
     unsigned randomSeed = static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count());
     bool useFixedSeed = false;
-    for (int argIndex = 1; argIndex + 1 < argc; argIndex++) {
-        if (std::string(argv[argIndex]) == "--seed") {
+    bool validateOnly = false;
+    bool validateAll = false;
+    bool validateTarget = false;
+    bool validateSkew = false;
+    bool validateSkewAll = false;
+    bool dumpPairedDescriptors = false;
+    bool dumpPairedDescriptorsAll = false;
+    int skewSampleCount = 128;
+    for (int argIndex = 1; argIndex < argc; argIndex++) {
+        const std::string arg = argv[argIndex];
+        if (arg == "--seed" && argIndex + 1 < argc) {
             randomSeed = static_cast<unsigned>(std::strtoul(argv[argIndex + 1], nullptr, 10));
             useFixedSeed = true;
-            break;
+            argIndex++;
+        } else if (arg == "--validate") {
+            validateOnly = true;
+        } else if (arg == "--validate-all") {
+            validateAll = true;
+        } else if (arg == "--validate-target") {
+            validateTarget = true;
+        } else if (arg == "--validate-skew") {
+            validateSkew = true;
+        } else if (arg == "--validate-skew-all") {
+            validateSkewAll = true;
+        } else if (arg == "--dump-paired-descriptors") {
+            dumpPairedDescriptors = true;
+        } else if (arg == "--dump-paired-descriptors-all") {
+            dumpPairedDescriptorsAll = true;
+        } else if (arg == "--skew-samples" && argIndex + 1 < argc) {
+            skewSampleCount = std::max(1, std::atoi(argv[argIndex + 1]));
+            argIndex++;
         }
     }
     srand(randomSeed);
 
     const std::string dataPath = "D:/Course/Projects/HairRender/MRPNN/Data/";
-    const std::string dataName = "DS_MRPNN_" + std::to_string(COUNT_ALL) + ".csv";
+    const std::string dataName = "DS_MRPNN_paper_" + std::to_string(kSamplesPerModel) + "_per_model.csv";
     const std::string relativePath = "D:/Course/Projects/HairRender/MRPNN/MyData/mrpnn/";
 
     std::vector<std::string> dataList;
@@ -742,10 +1081,11 @@ int main(int argc, char** argv) {
     for (auto& s : dataList) {
         std::cout << s << std::endl;
     }
+    if (dataList.empty()) {
+        std::cerr << "No .vol files found in " << relativePath << "\n";
+        return 1;
+    }
 
-    const bool validateOnly = argc > 1 && std::string(argv[1]) == "--validate";
-    const bool validateAll = argc > 1 && std::string(argv[1]) == "--validate-all";
-    const bool validateTarget = argc > 1 && std::string(argv[1]) == "--validate-target";
     if (validateOnly || validateAll) {
         if (useFixedSeed) {
             std::cout << "Using fixed seed: " << randomSeed << "\n";
@@ -767,10 +1107,51 @@ int main(int argc, char** argv) {
         }
         return RunTargetValidation(relativePath + dataList[0], dataList[0], 8) ? 0 : 1;
     }
+    if (validateSkew || validateSkewAll) {
+        if (useFixedSeed) {
+            std::cout << "Using fixed seed: " << randomSeed << "\n";
+        }
+        bool allPassed = true;
+        const int volumeCount = validateSkewAll ? static_cast<int>(dataList.size()) : std::min<int>(1, dataList.size());
+        for (int volumeIndex = 0; volumeIndex < volumeCount; volumeIndex++) {
+            const std::string& volumeName = dataList[volumeIndex];
+            allPassed = RunSkewValidation(relativePath + volumeName, volumeName, skewSampleCount) && allPassed;
+        }
+        return allPassed ? 0 : 1;
+    }
+    if (dumpPairedDescriptors || dumpPairedDescriptorsAll) {
+        if (useFixedSeed) {
+            std::cout << "Using fixed seed: " << randomSeed << "\n";
+        }
+        const std::string hostPath = dataPath + "skew_host.csv";
+        const std::string gpuPath = dataPath + "skew_gpu.csv";
+        std::ofstream hostOutfile(hostPath);
+        std::ofstream gpuOutfile(gpuPath);
+        hostOutfile << "# columns=" << kOutputColumns
+                    << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
+                    << ", source=host"
+                    << ", paired_descriptor_test=true"
+                    << ", samples_per_volume=" << skewSampleCount
+                    << "\n";
+        gpuOutfile << "# columns=" << kOutputColumns
+                   << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
+                   << ", source=gpu"
+                   << ", paired_descriptor_test=true"
+                   << ", samples_per_volume=" << skewSampleCount
+                   << "\n";
 
-    const int countAll = COUNT_ALL;
-    const int miniLoopCount = 1;
-    const int countPer = countAll / static_cast<int>(dataList.size()) / miniLoopCount;
+        const int volumeCount = dumpPairedDescriptorsAll ? static_cast<int>(dataList.size()) : std::min<int>(1, dataList.size());
+        for (int volumeIndex = 0; volumeIndex < volumeCount; volumeIndex++) {
+            const std::string& volumeName = dataList[volumeIndex];
+            DumpPairedDescriptorsForVolume(relativePath + volumeName, volumeName, skewSampleCount, hostOutfile, gpuOutfile);
+        }
+        std::cout << "Wrote paired descriptor CSVs:\n"
+                  << "  " << hostPath << "\n"
+                  << "  " << gpuPath << "\n";
+        return 0;
+    }
+
+    const int countAll = kSamplesPerModel * static_cast<int>(dataList.size());
     int computed = 0;
 
     //std::cout << dataName << std::endl;
@@ -782,89 +1163,103 @@ int main(int argc, char** argv) {
     std::ofstream outfile(dataPath + dataName);
     outfile << "# columns=" << kOutputColumns
             << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
+            << ", sampling=paper"
+            << ", samples_per_model=" << kSamplesPerModel
+            << ", condition_count_per_model=" << kConditionCountPerModel
             << ", zeta_range=[" << kMinZeta << "," << kMaxZeta << "]"
             << ", alpha=" << kAlbedoExponent
             << "\n";
 
-    for (int loop = 0; loop < miniLoopCount; loop++) {
-        for (int dataIndex = 0; dataIndex < static_cast<int>(dataList.size()); dataIndex++) {
-            printf("Processing %.2f%%\n", countAll > 0 ? 100.0f * computed / countAll : 0.0f);
-            printf("Computing: %s\n", dataList[dataIndex].c_str());
-            printf("Desired Size: %d\n", countPer);
+    for (int dataIndex = 0; dataIndex < static_cast<int>(dataList.size()); dataIndex++) {
+        printf("Processing %.2f%%\n", countAll > 0 ? 100.0f * computed / countAll : 0.0f);
+        printf("Computing: %s\n", dataList[dataIndex].c_str());
+        printf("Desired Size: %d\n", kSamplesPerModel);
 
-            VolumeRender volume(relativePath + dataList[dataIndex]);
-            std::vector<MRPNNDescriptorRow> rows;
-            rows.reserve(countPer);
+        VolumeRender volume(relativePath + dataList[dataIndex]);
+        std::vector<MRPNNDescriptorRow> rows;
+        rows.reserve(kSamplesPerModel);
 
-            while (static_cast<int>(rows.size()) < countPer) {
-                const float3 lightDir = hash31sphere();
-                const float epsilon = lerp(kEpsilonMin, kEpsilonMax, hash1());
+        for (int conditionIndex = 0; conditionIndex < kConditionCountPerModel; conditionIndex++) {
+            const float3 lightDir = hash31sphere();
+            const float epsilon = lerp(kEpsilonMin, kEpsilonMax, hash1());
+
+            volume.Update_TR(lightDir, epsilon, true);
+
+            printf("Condition %d/%d: epsilon=%.4f lightDir=(%.3f, %.3f, %.3f) count=%d\n",
+                conditionIndex + 1,
+                kConditionCountPerModel,
+                epsilon,
+                lightDir.x,
+                lightDir.y,
+                lightDir.z,
+                kSamplesPerCondition);
+
+            std::vector<MRPNNSamplePoint> samples;
+            samples.reserve(kSamplesPerCondition);
+            while (static_cast<int>(samples.size()) < kSamplesPerCondition) {
                 const float g = lerp(0.0f, kMaxG, hash1());
-                const int batchCount = std::min(kConditionBatchSize, countPer - static_cast<int>(rows.size()));
-
-                volume.UpdateHGLut(g);
-                volume.Update_TR(lightDir, epsilon, true);
-
-                printf("Condition batch: epsilon=%.4f g=%.4f lightDir=(%.3f, %.3f, %.3f) count=%d\n",
-                    epsilon, g, lightDir.x, lightDir.y, lightDir.z, batchCount);
-
-                std::vector<MRPNNSamplePoint> samples;
-                GetDesiredCountSample(volume, samples, batchCount, epsilon, g, lightDir);
-
-                std::vector<float3> samplePositions;
-                std::vector<float3> sampleDirs;
-                std::vector<float3> sampleLightDirs;
-                std::vector<float> sampleEpsilons;
-                std::vector<float> sampleGs;
-                std::vector<float> sampleScatters;
-
-                samplePositions.reserve(samples.size());
-                sampleDirs.reserve(samples.size());
-                sampleLightDirs.reserve(samples.size());
-                sampleEpsilons.reserve(samples.size());
-                sampleGs.reserve(samples.size());
-                sampleScatters.reserve(samples.size());
-
-                for (const MRPNNSamplePoint& sample : samples) {
-                    samplePositions.push_back(sample.position);
-                    sampleDirs.push_back(sample.viewDir);
-                    sampleLightDirs.push_back(sample.lightDir);
-                    sampleEpsilons.push_back(sample.epsilon);
-                    sampleGs.push_back(sample.g);
-                    sampleScatters.push_back(sample.albedo);
-                }
-
-                // `GetSamples` is the same high-order target that `NNPredict` uses in its
-                // commented reference path. Direct light is added later in `NNPredict`, so
-                // this supervision already corresponds to PredictRadiance only.
-                const float3 lightColor = {1.0f, 1.0f, 1.0f};
-                const std::vector<float3> predictRadiances = volume.GetSamples(
-                    sampleEpsilons,
-                    samplePositions,
-                    sampleDirs,
-                    sampleLightDirs,
-                    sampleGs,
-                    sampleScatters,
-                    lightColor,
-                    kPathTraceScatterCount,
-                    kPathTraceSampleCount);
-
-                for (size_t i = 0; i < samples.size(); i++) {
-                    rows.push_back(BuildDescriptorRow(volume, samples[i], predictRadiances[i].x));
+                std::vector<MRPNNSamplePoint> oneSample;
+                GetDesiredCountSample(volume, oneSample, 1, epsilon, g, lightDir);
+                if (!oneSample.empty()) {
+                    samples.push_back(oneSample.front());
                 }
             }
 
-            unsigned seed = static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count());
-            std::default_random_engine engine(seed);
-            std::shuffle(rows.begin(), rows.end(), engine);
+            std::vector<float3> samplePositions;
+            std::vector<float3> sampleDirs;
+            std::vector<float3> sampleLightDirs;
+            std::vector<float> sampleEpsilons;
+            std::vector<float> sampleGs;
+            std::vector<float> sampleScatters;
 
-            for (size_t i = 0; i < rows.size(); i++) {
-                if (i % std::max<size_t>(1, rows.size() / 8) == 0) {
-                    printf("Output Shuffle_Dataset: %.2f%%\n", 100.0f * static_cast<float>(i) / rows.size());
-                }
-                WriteRow(outfile, rows[i]);
-                computed++;
+            samplePositions.reserve(samples.size());
+            sampleDirs.reserve(samples.size());
+            sampleLightDirs.reserve(samples.size());
+            sampleEpsilons.reserve(samples.size());
+            sampleGs.reserve(samples.size());
+            sampleScatters.reserve(samples.size());
+
+            for (const MRPNNSamplePoint& sample : samples) {
+                samplePositions.push_back(sample.position);
+                sampleDirs.push_back(sample.viewDir);
+                sampleLightDirs.push_back(sample.lightDir);
+                sampleEpsilons.push_back(sample.epsilon);
+                sampleGs.push_back(sample.g);
+                sampleScatters.push_back(sample.albedo);
             }
+
+            // `GetSamples` is the same high-order target that `NNPredict` uses in its
+            // commented reference path. Direct light is added later in `NNPredict`, so
+            // this supervision already corresponds to PredictRadiance only.
+            const float3 lightColor = {1.0f, 1.0f, 1.0f};
+            const std::vector<float3> predictRadiances = volume.GetSamples(
+                sampleEpsilons,
+                samplePositions,
+                sampleDirs,
+                sampleLightDirs,
+                sampleGs,
+                sampleScatters,
+                lightColor,
+                kPathTraceScatterCount,
+                kPathTraceSampleCount);
+
+            for (size_t i = 0; i < samples.size(); i++) {
+                volume.UpdateHGLut(samples[i].g);
+                rows.push_back(BuildDescriptorRow(volume, samples[i], predictRadiances[i].x));
+            }
+            // AppendGpuDescriptorRows(volume, samples, predictRadiances, rows);
+        }
+
+        unsigned seed = static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count());
+        std::default_random_engine engine(seed);
+        std::shuffle(rows.begin(), rows.end(), engine);
+
+        for (size_t i = 0; i < rows.size(); i++) {
+            if (i % std::max<size_t>(1, rows.size() / 8) == 0) {
+                printf("Output Shuffle_Dataset: %.2f%%\n", 100.0f * static_cast<float>(i) / rows.size());
+            }
+            WriteRow(outfile, rows[i]);
+            computed++;
         }
     }
 
