@@ -5,10 +5,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 #include <vector>
 #include <filesystem>
 
@@ -16,9 +19,9 @@ namespace {
 
 constexpr int kStencilPointCount = 192;
 constexpr int kOutputColumns = kStencilPointCount * 3 + 4;
+constexpr int kFeatureColumns = kOutputColumns - 1;
 constexpr int kSamplesPerModel = 250000;
 constexpr int kConditionCountPerModel = 50;
-constexpr int kSamplesPerCondition = kSamplesPerModel / kConditionCountPerModel;
 static_assert(kSamplesPerModel % kConditionCountPerModel == 0, "Paper sampling requires an integer number of samples per condition.");
 constexpr int kPathTraceScatterCount = 512;
 constexpr int kPathTraceSampleCount = 1024;
@@ -887,6 +890,127 @@ void WriteRow(std::ofstream& outfile, const MRPNNDescriptorRow& row) {
     outfile << std::setiosflags(std::ios::fixed) << row.targetPredictRadiance << "\n";
 }
 
+std::string BuildNpyHeader(const std::vector<size_t>& shape) {
+    std::ostringstream shapeStream;
+    shapeStream << "(";
+    for (size_t i = 0; i < shape.size(); i++) {
+        if (i > 0) {
+            shapeStream << ", ";
+        }
+        shapeStream << shape[i];
+    }
+    if (shape.size() == 1) {
+        shapeStream << ",";
+    }
+    shapeStream << ")";
+
+    std::ostringstream dictStream;
+    dictStream << "{'descr': '<f4', 'fortran_order': False, 'shape': "
+               << shapeStream.str()
+               << ", }";
+    std::string header = dictStream.str();
+    const size_t prefixSize = 10;
+    const size_t newlineSize = 1;
+    const size_t padding = (16 - ((prefixSize + header.size() + newlineSize) % 16)) % 16;
+    header.append(padding, ' ');
+    header.push_back('\n');
+    return header;
+}
+
+void WriteNpyHeader(std::ofstream& outfile, const std::vector<size_t>& shape) {
+    const std::string header = BuildNpyHeader(shape);
+    if (header.size() > UINT16_MAX) {
+        throw std::runtime_error("NPY v1.0 header is too large.");
+    }
+
+    const char magic[6] = {static_cast<char>(0x93), 'N', 'U', 'M', 'P', 'Y'};
+    const char version[2] = {1, 0};
+    const uint16_t headerSize = static_cast<uint16_t>(header.size());
+    const char headerSizeBytes[2] = {
+        static_cast<char>(headerSize & 0xff),
+        static_cast<char>((headerSize >> 8) & 0xff),
+    };
+
+    outfile.write(magic, sizeof(magic));
+    outfile.write(version, sizeof(version));
+    outfile.write(headerSizeBytes, sizeof(headerSizeBytes));
+    outfile.write(header.data(), static_cast<std::streamsize>(header.size()));
+}
+
+void WriteFeatureValues(std::ofstream& outfile, const MRPNNDescriptorRow& row) {
+    outfile.write(reinterpret_cast<const char*>(row.density.data()), row.density.size() * sizeof(float));
+    outfile.write(reinterpret_cast<const char*>(row.transmittance.data()), row.transmittance.size() * sizeof(float));
+    outfile.write(reinterpret_cast<const char*>(row.phase.data()), row.phase.size() * sizeof(float));
+    outfile.write(reinterpret_cast<const char*>(&row.g), sizeof(float));
+    outfile.write(reinterpret_cast<const char*>(&row.zetaPowAlpha), sizeof(float));
+    outfile.write(reinterpret_cast<const char*>(&row.gamma), sizeof(float));
+}
+
+void WriteBinaryRows(
+    std::ofstream& featureOutfile,
+    std::ofstream& targetOutfile,
+    const std::vector<MRPNNDescriptorRow>& rows) {
+    for (const MRPNNDescriptorRow& row : rows) {
+        WriteFeatureValues(featureOutfile, row);
+        targetOutfile.write(reinterpret_cast<const char*>(&row.targetPredictRadiance), sizeof(float));
+    }
+}
+
+std::vector<MRPNNDescriptorRow> MakeBinaryValidationRows() {
+    std::vector<MRPNNDescriptorRow> rows;
+    rows.reserve(8);
+    for (int rowIndex = 0; rowIndex < 8; rowIndex++) {
+        MRPNNDescriptorRow row;
+        for (int pointIndex = 0; pointIndex < kStencilPointCount; pointIndex++) {
+            row.density[pointIndex] = 0.001f * static_cast<float>(pointIndex + 1)
+                + 0.1f * static_cast<float>(rowIndex);
+            row.transmittance[pointIndex] = 0.002f * static_cast<float>(pointIndex + 1)
+                + 0.01f * static_cast<float>(rowIndex);
+            row.phase[pointIndex] = -0.003f * static_cast<float>(pointIndex + 1)
+                + 0.001f * static_cast<float>(rowIndex);
+        }
+        row.g = 0.05f * static_cast<float>(rowIndex);
+        row.zetaPowAlpha = 1.0f - 0.04f * static_cast<float>(rowIndex);
+        row.gamma = -0.2f + 0.03f * static_cast<float>(rowIndex);
+        row.targetPredictRadiance = 0.25f + 0.125f * static_cast<float>(rowIndex);
+        rows.push_back(row);
+    }
+    return rows;
+}
+
+bool RunBinaryOutputValidation(const std::string& dataPath) {
+    const std::vector<MRPNNDescriptorRow> rows = MakeBinaryValidationRows();
+    const std::string csvPath = dataPath + "binary_validation.csv";
+    const std::string featurePath = dataPath + "binary_validation_features.npy";
+    const std::string targetPath = dataPath + "binary_validation_targets.npy";
+
+    std::ofstream csvOutfile(csvPath);
+    csvOutfile << "# columns=" << kOutputColumns
+               << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
+               << ", binary_validation=true"
+               << "\n";
+    for (const MRPNNDescriptorRow& row : rows) {
+        WriteRow(csvOutfile, row);
+    }
+    csvOutfile.close();
+
+    std::ofstream featureOutfile(featurePath, std::ios::binary);
+    std::ofstream targetOutfile(targetPath, std::ios::binary);
+    WriteNpyHeader(featureOutfile, {rows.size(), static_cast<size_t>(kFeatureColumns)});
+    WriteNpyHeader(targetOutfile, {rows.size()});
+    WriteBinaryRows(featureOutfile, targetOutfile, rows);
+    featureOutfile.close();
+    targetOutfile.close();
+
+    const bool passed = csvOutfile.good() && featureOutfile.good() && targetOutfile.good();
+    std::cout << "Wrote binary validation files:\n"
+              << "  " << csvPath << "\n"
+              << "  " << featurePath << "\n"
+              << "  " << targetPath << "\n"
+              << "  result: " << (passed ? "PASS" : "FAIL") << "\n";
+    return passed;
+}
+
 void DumpPairedDescriptorsForVolume(
     const std::string& volumePath,
     const std::string& volumeName,
@@ -1037,7 +1161,12 @@ int main(int argc, char** argv) {
     bool validateSkewAll = false;
     bool dumpPairedDescriptors = false;
     bool dumpPairedDescriptorsAll = false;
+    bool validateBinaryOutput = false;
+    bool writeCsv = false;
     int skewSampleCount = 128;
+    int samplesPerModel = kSamplesPerModel;
+    int conditionCountPerModel = kConditionCountPerModel;
+    int maxVolumes = 0;
     for (int argIndex = 1; argIndex < argc; argIndex++) {
         const std::string arg = argv[argIndex];
         if (arg == "--seed" && argIndex + 1 < argc) {
@@ -1058,15 +1187,31 @@ int main(int argc, char** argv) {
             dumpPairedDescriptors = true;
         } else if (arg == "--dump-paired-descriptors-all") {
             dumpPairedDescriptorsAll = true;
+        } else if (arg == "--validate-binary-output") {
+            validateBinaryOutput = true;
+        } else if (arg == "--write-csv") {
+            writeCsv = true;
         } else if (arg == "--skew-samples" && argIndex + 1 < argc) {
             skewSampleCount = std::max(1, std::atoi(argv[argIndex + 1]));
+            argIndex++;
+        } else if (arg == "--samples-per-model" && argIndex + 1 < argc) {
+            samplesPerModel = std::max(1, std::atoi(argv[argIndex + 1]));
+            argIndex++;
+        } else if (arg == "--condition-count" && argIndex + 1 < argc) {
+            conditionCountPerModel = std::max(1, std::atoi(argv[argIndex + 1]));
+            argIndex++;
+        } else if (arg == "--max-volumes" && argIndex + 1 < argc) {
+            maxVolumes = std::max(1, std::atoi(argv[argIndex + 1]));
             argIndex++;
         }
     }
     srand(randomSeed);
 
     const std::string dataPath = "D:/Course/Projects/HairRender/MRPNN/Data/";
-    const std::string dataName = "DS_MRPNN_paper_" + std::to_string(kSamplesPerModel) + "_per_model.csv";
+    const std::string dataBaseName = "DS_MRPNN_paper_" + std::to_string(samplesPerModel) + "_per_model";
+    const std::string csvName = dataBaseName + ".csv";
+    const std::string featureName = dataBaseName + "_features.npy";
+    const std::string targetName = dataBaseName + "_targets.npy";
     const std::string relativePath = "D:/Course/Projects/HairRender/MRPNN/MyData/mrpnn/";
 
     std::vector<std::string> dataList;
@@ -1084,6 +1229,9 @@ int main(int argc, char** argv) {
     if (dataList.empty()) {
         std::cerr << "No .vol files found in " << relativePath << "\n";
         return 1;
+    }
+    if (maxVolumes > 0 && maxVolumes < static_cast<int>(dataList.size())) {
+        dataList.resize(static_cast<size_t>(maxVolumes));
     }
 
     if (validateOnly || validateAll) {
@@ -1150,8 +1298,18 @@ int main(int argc, char** argv) {
                   << "  " << gpuPath << "\n";
         return 0;
     }
+    if (validateBinaryOutput) {
+        return RunBinaryOutputValidation(dataPath) ? 0 : 1;
+    }
 
-    const int countAll = kSamplesPerModel * static_cast<int>(dataList.size());
+    if (samplesPerModel % conditionCountPerModel != 0) {
+        std::cerr << "--samples-per-model must be divisible by --condition-count.\n"
+                  << "  samples_per_model=" << samplesPerModel << "\n"
+                  << "  condition_count=" << conditionCountPerModel << "\n";
+        return 1;
+    }
+    const int samplesPerCondition = samplesPerModel / conditionCountPerModel;
+    const int countAll = samplesPerModel * static_cast<int>(dataList.size());
     int computed = 0;
 
     //std::cout << dataName << std::endl;
@@ -1160,26 +1318,40 @@ int main(int argc, char** argv) {
 
     auto start = std::chrono::steady_clock::now();
 
-    std::ofstream outfile(dataPath + dataName);
-    outfile << "# columns=" << kOutputColumns
-            << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
-            << ", sampling=paper"
-            << ", samples_per_model=" << kSamplesPerModel
-            << ", condition_count_per_model=" << kConditionCountPerModel
-            << ", zeta_range=[" << kMinZeta << "," << kMaxZeta << "]"
-            << ", alpha=" << kAlbedoExponent
-            << "\n";
+    std::ofstream featureOutfile(dataPath + featureName, std::ios::binary);
+    std::ofstream targetOutfile(dataPath + targetName, std::ios::binary);
+    if (!featureOutfile || !targetOutfile) {
+        std::cerr << "Failed to open binary output files:\n"
+                  << "  " << dataPath + featureName << "\n"
+                  << "  " << dataPath + targetName << "\n";
+        return 1;
+    }
+    WriteNpyHeader(featureOutfile, {static_cast<size_t>(countAll), static_cast<size_t>(kFeatureColumns)});
+    WriteNpyHeader(targetOutfile, {static_cast<size_t>(countAll)});
+
+    std::ofstream csvOutfile;
+    if (writeCsv) {
+        csvOutfile.open(dataPath + csvName);
+        csvOutfile << "# columns=" << kOutputColumns
+                   << ", layout=F_mu[192],F_S[192],F_P[192],g,zeta_pow_alpha,gamma,target_predict_radiance"
+                   << ", sampling=paper"
+                   << ", samples_per_model=" << samplesPerModel
+                   << ", condition_count_per_model=" << conditionCountPerModel
+                   << ", zeta_range=[" << kMinZeta << "," << kMaxZeta << "]"
+                   << ", alpha=" << kAlbedoExponent
+                   << "\n";
+    }
 
     for (int dataIndex = 0; dataIndex < static_cast<int>(dataList.size()); dataIndex++) {
         printf("Processing %.2f%%\n", countAll > 0 ? 100.0f * computed / countAll : 0.0f);
         printf("Computing: %s\n", dataList[dataIndex].c_str());
-        printf("Desired Size: %d\n", kSamplesPerModel);
+        printf("Desired Size: %d\n", samplesPerModel);
 
         VolumeRender volume(relativePath + dataList[dataIndex]);
         std::vector<MRPNNDescriptorRow> rows;
-        rows.reserve(kSamplesPerModel);
+        rows.reserve(samplesPerModel);
 
-        for (int conditionIndex = 0; conditionIndex < kConditionCountPerModel; conditionIndex++) {
+        for (int conditionIndex = 0; conditionIndex < conditionCountPerModel; conditionIndex++) {
             const float3 lightDir = hash31sphere();
             const float epsilon = lerp(kEpsilonMin, kEpsilonMax, hash1());
 
@@ -1187,16 +1359,16 @@ int main(int argc, char** argv) {
 
             printf("Condition %d/%d: epsilon=%.4f lightDir=(%.3f, %.3f, %.3f) count=%d\n",
                 conditionIndex + 1,
-                kConditionCountPerModel,
+                conditionCountPerModel,
                 epsilon,
                 lightDir.x,
                 lightDir.y,
                 lightDir.z,
-                kSamplesPerCondition);
+                samplesPerCondition);
 
             std::vector<MRPNNSamplePoint> samples;
-            samples.reserve(kSamplesPerCondition);
-            while (static_cast<int>(samples.size()) < kSamplesPerCondition) {
+            samples.reserve(samplesPerCondition);
+            while (static_cast<int>(samples.size()) < samplesPerCondition) {
                 const float g = lerp(0.0f, kMaxG, hash1());
                 std::vector<MRPNNSamplePoint> oneSample;
                 GetDesiredCountSample(volume, oneSample, 1, epsilon, g, lightDir);
@@ -1250,24 +1422,38 @@ int main(int argc, char** argv) {
             // AppendGpuDescriptorRows(volume, samples, predictRadiances, rows);
         }
 
-        unsigned seed = static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count());
-        std::default_random_engine engine(seed);
+        const unsigned shuffleSeed = useFixedSeed
+            ? randomSeed + static_cast<unsigned>(dataIndex) * 7919u
+            : static_cast<unsigned>(std::chrono::system_clock::now().time_since_epoch().count());
+        std::default_random_engine engine(shuffleSeed);
         std::shuffle(rows.begin(), rows.end(), engine);
 
         for (size_t i = 0; i < rows.size(); i++) {
             if (i % std::max<size_t>(1, rows.size() / 8) == 0) {
                 printf("Output Shuffle_Dataset: %.2f%%\n", 100.0f * static_cast<float>(i) / rows.size());
             }
-            WriteRow(outfile, rows[i]);
+            if (writeCsv) {
+                WriteRow(csvOutfile, rows[i]);
+            }
             computed++;
         }
+        WriteBinaryRows(featureOutfile, targetOutfile, rows);
     }
 
-    outfile.close();
+    featureOutfile.close();
+    targetOutfile.close();
+    if (writeCsv) {
+        csvOutfile.close();
+    }
 
     const auto end = std::chrono::steady_clock::now();
     const auto dtime = end - start;
     std::cout << "Render complete:\n";
+    std::cout << "Features: " << dataPath + featureName << "\n";
+    std::cout << "Targets : " << dataPath + targetName << "\n";
+    if (writeCsv) {
+        std::cout << "CSV     : " << dataPath + csvName << "\n";
+    }
     std::cout << "Time taken: "
               << std::chrono::duration_cast<std::chrono::hours>(dtime).count()
               << " hours\n";
