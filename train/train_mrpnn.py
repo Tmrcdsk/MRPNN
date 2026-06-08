@@ -585,7 +585,7 @@ class MRPNN(nn.Module):
         for first, second in self.residual_blocks:
             x = x + self._relu_linear(second, self._relu_linear(first, x))
 
-        return self.output_layer(x).squeeze(1)
+        return F.relu(self.output_layer(x), inplace=False).squeeze(1)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.forward_log_radiance(features)
